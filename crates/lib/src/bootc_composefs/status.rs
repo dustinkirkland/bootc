@@ -268,7 +268,7 @@ pub(crate) fn get_sorted_staged_type1_boot_entries(
 }
 
 #[context("Getting sorted Type1 boot entries")]
-fn get_sorted_type1_boot_entries_helper(
+pub(crate) fn get_sorted_type1_boot_entries_helper(
     boot_dir: &Dir,
     ascending: bool,
     get_staged_entries: bool,
@@ -347,13 +347,24 @@ fn get_sorted_type1_boot_entries_helper(
         .collect())
 }
 
-pub(crate) fn list_type1_entries(boot_dir: &Dir) -> Result<Vec<BootloaderEntry>> {
+/// List Type 1 boot entries, including staged ones.
+///
+/// The bootloader is supplied by the caller rather than resolved here: every
+/// caller has already determined it, and taking it as a parameter keeps this
+/// function free of ambient `/boot` state so it can be unit tested. That
+/// matters more now that an unclassifiable system is an error rather than a
+/// silent GRUB default.
+pub(crate) fn list_type1_entries(
+    boot_dir: &Dir,
+    bootloader: crate::spec::Bootloader,
+) -> Result<Vec<BootloaderEntry>> {
     // Type1 Entry
-    let boot_entries = get_sorted_type1_boot_entries(boot_dir, true)?;
+    let boot_entries = get_sorted_type1_boot_entries_helper(boot_dir, true, false, bootloader)?;
 
     // We wouldn't want to delete the staged deployment if the GC runs when a
     // deployment is staged
-    let staged_boot_entries = get_sorted_staged_type1_boot_entries(boot_dir, true)?;
+    let staged_boot_entries =
+        get_sorted_type1_boot_entries_helper(boot_dir, true, true, bootloader)?;
 
     boot_entries
         .into_iter()
@@ -401,11 +412,11 @@ pub(crate) fn list_bootloader_entries(storage: &Storage) -> Result<Vec<Bootloade
                     })
                     .collect::<Result<Vec<_>, anyhow::Error>>()?
             } else {
-                list_type1_entries(boot_dir)?
+                list_type1_entries(boot_dir, bootloader)?
             }
         }
 
-        BootloaderKind::BLSCompatible => list_type1_entries(boot_dir)?,
+        BootloaderKind::BLSCompatible => list_type1_entries(boot_dir, bootloader)?,
     };
 
     Ok(entries)
@@ -459,24 +470,28 @@ const GRUB_DIRS: [&str; 2] = ["/boot/grub2", "/boot/grub"];
 
 /// Pure classifier for the bootloader kind, split from I/O for testability.
 ///
+/// Every branch either identifies a bootloader from positive evidence or
+/// fails; there is deliberately no default. Guessing GRUB for a system we
+/// cannot classify silently selects the wrong `boot_dir` in `storage::new`,
+/// which resurfaces much later as a confusing `ENOENT` on `loader/entries`
+/// instead of the classification failure it actually is.
+///
 /// - When `EFI_LOADER_INFO` is present, its content selects between systemd-
-///   boot, GRUB Confidential Compute, and generic GRUB (existing behavior).
+///   boot and GRUB Confidential Compute. Anything else is an error.
 /// - When there are no EFI variables to inspect (`SystemNotUEFI` /
 ///   `MissingVar`), fall back to a filesystem probe: many non-EFI systems
 ///   still lay down the BLS Type 1 entry layout at `/boot/loader/entries/`
 ///   (Raspberry Pi with direct-kernel boot from Pi firmware, U-Boot with
 ///   the extlinux/BLS loader, coreboot with a linux payload, various
 ///   ARM/embedded boards). Treat those as BLS-compatible so `storage::new`
-///   picks the ESP mount as `boot_dir` rather than `/sysroot/boot/`. Only
-///   fall back to GRUB when neither an EFI system nor a BLS layout is
-///   present.
+///   picks the ESP mount as `boot_dir` rather than `/sysroot/boot/`.
 ///
 ///   A BLS entries directory alone is not sufficient evidence, because GRUB
 ///   with `blscfg` reads the same directory. So GRUB's own directory wins
 ///   when both are present: a legacy-BIOS Fedora/RHEL install has
 ///   `/boot/grub2/` *and* `/boot/loader/entries/`, and is unambiguously
 ///   GRUB. Only a BLS layout with no GRUB directory implies a BLS-native
-///   bootloader.
+///   bootloader. Neither marker present is an error.
 /// - Other EFI read errors propagate.
 fn classify_bootloader(
     efi_loader_info: Result<String, EfiError>,
@@ -485,13 +500,13 @@ fn classify_bootloader(
 ) -> Result<Bootloader> {
     match efi_loader_info {
         Ok(loader) => {
-            let loader = loader.to_lowercase();
-            if loader.contains("systemd-boot") {
+            let lowered = loader.to_lowercase();
+            if lowered.contains("systemd-boot") {
                 Ok(Bootloader::Systemd)
-            } else if loader.contains("grub cc") {
+            } else if lowered.contains("grub cc") {
                 Ok(Bootloader::GrubCC)
             } else {
-                Ok(Bootloader::Grub)
+                anyhow::bail!("Unrecognized bootloader in EFI_LOADER_INFO: {loader:?}")
             }
         }
         Err(EfiError::SystemNotUEFI) | Err(EfiError::MissingVar) => {
@@ -510,7 +525,11 @@ fn classify_bootloader(
                 );
                 Ok(Bootloader::Systemd)
             } else {
-                Ok(Bootloader::Grub)
+                anyhow::bail!(
+                    "Unable to determine bootloader: no EFI variables, no GRUB \
+                     directory ({}), and no BLS entries at {BLS_ENTRIES_DIR}",
+                    GRUB_DIRS.join(", ")
+                )
             }
         }
         Err(e) => anyhow::bail!("Failed to read EfiLoaderInfo: {e:?}"),
@@ -1170,7 +1189,9 @@ mod tests {
             efi: Result<String, EfiError>,
             bls: bool,
             grub_dir: bool,
-            expected: Bootloader,
+            /// `None` means the case must be rejected with an error rather
+            /// than silently defaulting to a bootloader.
+            expected: Option<Bootloader>,
         }
         let cases = [
             Case {
@@ -1178,49 +1199,49 @@ mod tests {
                 efi: Ok("systemd-boot 261.2".into()),
                 bls: false,
                 grub_dir: false,
-                expected: Bootloader::Systemd,
+                expected: Some(Bootloader::Systemd),
             },
             Case {
                 desc: "UEFI, EFI_LOADER_INFO advertises GRUB CC",
                 efi: Ok("GRUB CC 2.12".into()),
                 bls: false,
                 grub_dir: false,
-                expected: Bootloader::GrubCC,
+                expected: Some(Bootloader::GrubCC),
             },
             Case {
-                desc: "UEFI, EFI_LOADER_INFO advertises unknown; default GRUB",
+                desc: "UEFI, EFI_LOADER_INFO unrecognized: error, no default",
                 efi: Ok("something else 1.0".into()),
                 bls: false,
                 grub_dir: false,
-                expected: Bootloader::Grub,
+                expected: None,
             },
             Case {
                 desc: "Non-EFI + BLS layout present: BLS (regression fix)",
                 efi: Err(EfiError::SystemNotUEFI),
                 bls: true,
                 grub_dir: false,
-                expected: Bootloader::Systemd,
+                expected: Some(Bootloader::Systemd),
             },
             Case {
-                desc: "Non-EFI + no BLS layout: fall back to GRUB",
+                desc: "Non-EFI, no BLS, no GRUB dir: error, no default",
                 efi: Err(EfiError::SystemNotUEFI),
                 bls: false,
                 grub_dir: false,
-                expected: Bootloader::Grub,
+                expected: None,
             },
             Case {
                 desc: "EFI mounted but EFI_LOADER_INFO missing, BLS present",
                 efi: Err(EfiError::MissingVar),
                 bls: true,
                 grub_dir: false,
-                expected: Bootloader::Systemd,
+                expected: Some(Bootloader::Systemd),
             },
             Case {
-                desc: "EFI mounted but EFI_LOADER_INFO missing, no BLS: GRUB",
+                desc: "EFI_LOADER_INFO missing, no BLS, no GRUB dir: error",
                 efi: Err(EfiError::MissingVar),
                 bls: false,
                 grub_dir: false,
-                expected: Bootloader::Grub,
+                expected: None,
             },
             // A legacy-BIOS Fedora/RHEL install with GRUB_ENABLE_BLSCFG=true
             // has both directories and is unambiguously GRUB. Without the
@@ -1231,21 +1252,21 @@ mod tests {
                 efi: Err(EfiError::SystemNotUEFI),
                 bls: true,
                 grub_dir: true,
-                expected: Bootloader::Grub,
+                expected: Some(Bootloader::Grub),
             },
             Case {
                 desc: "Non-EFI + GRUB dir, no BLS: GRUB",
                 efi: Err(EfiError::SystemNotUEFI),
                 bls: false,
                 grub_dir: true,
-                expected: Bootloader::Grub,
+                expected: Some(Bootloader::Grub),
             },
             Case {
                 desc: "EFI_LOADER_INFO missing + BLS + GRUB dir: GRUB wins",
                 efi: Err(EfiError::MissingVar),
                 bls: true,
                 grub_dir: true,
-                expected: Bootloader::Grub,
+                expected: Some(Bootloader::Grub),
             },
             // The regression this PR fixes must survive the new probe: a
             // BLS layout with no GRUB directory is still BLS-native.
@@ -1254,7 +1275,7 @@ mod tests {
                 efi: Err(EfiError::SystemNotUEFI),
                 bls: true,
                 grub_dir: false,
-                expected: Bootloader::Systemd,
+                expected: Some(Bootloader::Systemd),
             },
             // UEFI classification must ignore both probes entirely.
             Case {
@@ -1262,13 +1283,34 @@ mod tests {
                 efi: Ok("systemd-boot 261.2".into()),
                 bls: true,
                 grub_dir: true,
-                expected: Bootloader::Systemd,
+                expected: Some(Bootloader::Systemd),
+            },
+            // An unrecognized EFI loader string must error even when the
+            // filesystem markers would otherwise be conclusive: the EFI
+            // branch never consults them.
+            Case {
+                desc: "UEFI unrecognized loader + both markers: still error",
+                efi: Ok("weird-loader 1.0".into()),
+                bls: true,
+                grub_dir: true,
+                expected: None,
             },
         ];
         for case in cases {
-            let got = classify_bootloader(case.efi, case.bls, case.grub_dir)
-                .unwrap_or_else(|e| panic!("{}: {e}", case.desc));
-            assert_eq!(got, case.expected, "{}", case.desc);
+            let got = classify_bootloader(case.efi, case.bls, case.grub_dir);
+            match case.expected {
+                Some(want) => {
+                    let got =
+                        got.unwrap_or_else(|e| panic!("{}: unexpected error: {e}", case.desc));
+                    assert_eq!(got, want, "{}", case.desc);
+                }
+                None => assert!(
+                    got.is_err(),
+                    "{}: expected an error, got {:?}",
+                    case.desc,
+                    got.ok()
+                ),
+            }
         }
     }
 
@@ -1475,7 +1517,9 @@ mod tests {
         tempdir.atomic_write("loader/entries/active.conf", active_entry)?;
         tempdir.atomic_write("loader/entries.staged/staged.conf", staged_entry)?;
 
-        let result = list_type1_entries(&tempdir)?;
+        // Bootloader is supplied explicitly so the test does not depend on
+        // the host's `/boot` layout; both entries are collected either way.
+        let result = list_type1_entries(&tempdir, Bootloader::Grub)?;
         assert_eq!(result.len(), 2);
 
         let verity_set: std::collections::HashSet<&str> =
