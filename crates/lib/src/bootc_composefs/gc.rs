@@ -506,6 +506,7 @@ pub(crate) async fn composefs_gc(
 mod tests {
     use super::*;
     use crate::bootc_composefs::status::list_type1_entries;
+    use crate::spec::Bootloader;
     use crate::testutils::{ChangeType, TestRoot};
 
     /// Reproduce the shared-entry GC bug from issue #2102.
@@ -560,7 +561,7 @@ mod tests {
         );
 
         // Collect what the BLS entries reference
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         assert_eq!(bls_entries.len(), 2, "D (primary) + C (secondary)");
 
         // The fix: unreferenced_boot_binaries uses boot_artifact_name.
@@ -590,7 +591,7 @@ mod tests {
         // A's dir + C's dir still on disk (boot binary cleanup hasn't run)
         assert_eq!(on_disk_2.len(), 2);
 
-        let bls_entries_2 = list_type1_entries(&root.boot_dir()?)?;
+        let bls_entries_2 = list_type1_entries(&root.boot_dir()?, Bootloader::Grub)?;
         // D (primary) + B (secondary)
         assert_eq!(bls_entries_2.len(), 2);
 
@@ -643,7 +644,7 @@ mod tests {
         let digest_b = root.current().verity.clone();
 
         let boot_dir = root.boot_dir()?;
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
 
         assert_eq!(bls_entries.len(), 2, "Should find both BLS entries");
 
@@ -714,7 +715,7 @@ mod tests {
         assert_eq!(on_disk.len(), 2, "Should see A's and C's boot dirs");
 
         // BLS entries should correctly reference boot artifact names
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         assert_eq!(bls_entries.len(), 2);
 
         // No boot dirs should be unreferenced (all are in use)
@@ -728,7 +729,7 @@ mod tests {
         root.gc_deployment(&digest_a)?;
 
         let boot_dir = root.boot_dir()?;
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         assert_eq!(bls_entries.len(), 2, "B (secondary) + C (primary)");
 
         let mut on_disk = Vec::new();
@@ -776,7 +777,7 @@ mod tests {
         let mut on_disk = Vec::new();
         collect_type1_boot_binaries(&boot_dir, &mut on_disk)?;
 
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         assert_eq!(bls_entries.len(), 2, "D (primary) + C (secondary)");
 
         let unreferenced = unreferenced_boot_binaries(&on_disk, &bls_entries);
@@ -835,7 +836,7 @@ mod tests {
         assert_eq!(on_disk[0].1, digest_a, "The boot dir belongs to A");
 
         // BLS entries: D (primary) + C (secondary), both referencing A's dir
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         assert_eq!(bls_entries.len(), 2);
         for entry in &bls_entries {
             assert_eq!(
@@ -848,7 +849,7 @@ mod tests {
         root.gc_deployment(&digest_a)?;
 
         let boot_dir = root.boot_dir()?;
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         // D (primary) + C (secondary) — A was already evicted from BLS
         assert_eq!(bls_entries.len(), 2);
 
@@ -869,7 +870,7 @@ mod tests {
 
         // D is the only deployment left
         let boot_dir = root.boot_dir()?;
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         assert_eq!(bls_entries.len(), 1, "Only D remains");
         assert_eq!(bls_entries[0].fsverity, digest_d);
         assert_eq!(
@@ -896,7 +897,7 @@ mod tests {
     /// uses to decide which entries to migrate.
     #[test]
     fn test_boot_artifact_info_drives_migration_decisions() -> anyhow::Result<()> {
-        use crate::bootc_composefs::status::get_sorted_type1_boot_entries;
+        use crate::bootc_composefs::status::get_sorted_type1_boot_entries_helper;
 
         let mut root = TestRoot::new_legacy()?;
         let digest_a = root.current().verity.clone();
@@ -906,7 +907,8 @@ mod tests {
 
         // -- Pre-migration: all entries lack the prefix --
         let boot_dir = root.boot_dir()?;
-        let raw_entries = get_sorted_type1_boot_entries(&boot_dir, true)?;
+        let raw_entries =
+            get_sorted_type1_boot_entries_helper(&boot_dir, true, false, Bootloader::Grub)?;
         assert_eq!(raw_entries.len(), 2);
 
         let needs_migration: Vec<_> = raw_entries
@@ -929,7 +931,8 @@ mod tests {
 
         // -- Post-migration: all entries have the prefix --
         let boot_dir = root.boot_dir()?;
-        let raw_entries = get_sorted_type1_boot_entries(&boot_dir, true)?;
+        let raw_entries =
+            get_sorted_type1_boot_entries_helper(&boot_dir, true, false, Bootloader::Grub)?;
         assert_eq!(raw_entries.len(), 2);
 
         let needs_migration: Vec<_> = raw_entries
@@ -947,7 +950,7 @@ mod tests {
         assert_eq!(on_disk.len(), 2, "Both dirs visible after migration");
 
         // GC filter correctly identifies all dirs as referenced
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         let unreferenced = unreferenced_boot_binaries(&on_disk, &bls_entries);
         assert!(
             unreferenced.is_empty(),
@@ -958,7 +961,8 @@ mod tests {
         root.upgrade(3, ChangeType::Kernel)?;
 
         let boot_dir = root.boot_dir()?;
-        let raw_entries = get_sorted_type1_boot_entries(&boot_dir, true)?;
+        let raw_entries =
+            get_sorted_type1_boot_entries_helper(&boot_dir, true, false, Bootloader::Grub)?;
         // All entries (both migrated and new) should have the prefix
         for entry in &raw_entries {
             let (_, has_prefix) = entry.boot_artifact_info()?;
@@ -975,7 +979,7 @@ mod tests {
         assert_eq!(on_disk.len(), 3, "Three boot dirs on disk");
 
         // Only 2 BLS entries (primary + secondary), so one dir is unreferenced
-        let bls_entries = list_type1_entries(&boot_dir)?;
+        let bls_entries = list_type1_entries(&boot_dir, Bootloader::Grub)?;
         assert_eq!(bls_entries.len(), 2);
         let unreferenced = unreferenced_boot_binaries(&on_disk, &bls_entries);
         assert_eq!(
